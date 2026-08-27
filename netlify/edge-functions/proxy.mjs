@@ -1,7 +1,12 @@
 // Edge proxy: browser -> this function -> RunPod OpenAI-compatible endpoint.
 // Returns SSE headers immediately, then pipes upstream bytes through as they
-// arrive — survives multi-minute cold boots (Netlify edge allows long streams
-// once headers are returned within 40s).
+// arrive.
+//
+// IMPORTANT: RunPod's OpenAI streaming route HANGS until a fixed ~300s cap
+// when the request lands while the worker is cold-booting (observed twice:
+// exactly 300.1s, empty stream, warm streaming works fine). So we pre-flight
+// /models with a short timeout and refuse (503 {cold:true}) if the worker
+// isn't ready. The UI runs the wake loop and resends.
 //
 // Env vars (Netlify UI -> Site configuration -> Environment variables):
 //   RUNPOD_API_KEY    (required) RunPod API key, sent as Bearer to the endpoint
@@ -10,7 +15,8 @@
 
 const DEFAULT_BASE = "https://api.runpod.ai/v2/c35fhlr8aefckk/openai/v1";
 const MODEL = "sakamakismile/Huihui-Qwen3.8-27B-abliterated-NVFP4";
-const UPSTREAM_TIMEOUT_MS = 540000; // 9 min hard cap for a full cold boot
+const UPSTREAM_TIMEOUT_MS = 540000; // 9 min hard cap for a warm streaming call
+const WARM_CHECK_TIMEOUT_MS = 5000; // fast pre-flight; UI handles the cold path
 const MAX_TOKENS_CAP = 8000; // stay well below 64K ctx; near-ctx max_tokens -> empty stream
 
 function envGet(name) {
@@ -33,6 +39,18 @@ function json(obj, status = 200) {
   });
 }
 
+async function workerReady(base, key) {
+  try {
+    const r = await fetch(`${base}/models`, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(WARM_CHECK_TIMEOUT_MS),
+    });
+    return r.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
 export default async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204 });
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
@@ -51,6 +69,11 @@ export default async (req) => {
     payload = await req.json();
   } catch (_) {
     return json({ error: "invalid JSON body" }, 400);
+  }
+
+  // Cold gate: never send a streaming request into a cold boot.
+  if (!(await workerReady(base, key))) {
+    return json({ error: "worker cold — waking GPU, retry in a moment", cold: true }, 503);
   }
 
   payload.model = payload.model || MODEL;
@@ -93,7 +116,7 @@ export default async (req) => {
         }
       } catch (e) {
         const msg = e && e.name === "TimeoutError"
-          ? "cold boot exceeded 9 min — worker may be wedged; try again or redeploy endpoint"
+          ? "upstream timeout — worker may have wedged; try again"
           : `proxy error: ${(e && e.message) || e}`;
         send({ error: msg });
       }

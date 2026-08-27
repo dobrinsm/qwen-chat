@@ -178,6 +178,35 @@ function streamEnd(div) {
 
 function setStatus(cls, text) { statusEl.className = cls; statusEl.textContent = text; }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// POST /api/chat with cold-start handling: proxy returns 503 {cold:true} while
+// the RunPod worker boots; we show a wake banner and auto-retry (~5 min max).
+async function postChatWithWake(headers, payload) {
+  const MAX_ATTEMPTS = 20; // 20 x 15s = 5 min of patience
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch("/api/chat", {
+      method: "POST", headers, body: JSON.stringify(payload), signal: controller.signal,
+    });
+    if (res.ok) { banner.classList.remove("show"); return res; }
+    let j = null;
+    try { j = await res.json(); } catch (_) {}
+    if (res.status === 503 && j && j.cold && attempt < MAX_ATTEMPTS) {
+      banner.classList.add("show");
+      const mins = Math.round(attempt * 0.25);
+      banner.textContent = `GPU is waking (cold start ≈ 2–7 min). Waiting… ~${mins} min elapsed.`;
+      setStatus("cold", "○ waking");
+      await sleep(15000);
+      continue;
+    }
+    if (res.status === 401) {
+      localStorage.removeItem("qwenchat.code");
+      throw new Error((j && j.error || "unauthorized") + " — set access code in ⚙ settings");
+    }
+    throw new Error((j && j.error) || `HTTP ${res.status}`);
+  }
+}
+
 // ---- warm check (only on load / after errors — never poll) ----
 async function checkWarm() {
   setStatus("", "checking…");
@@ -220,14 +249,11 @@ async function send() {
     const sys = localStorage.getItem("qwenchat.system");
     if (sys) payload.messages = [{ role: "system", content: sys }, ...payload.messages];
 
-    const res = await fetch("/api/chat", {
-      method: "POST", headers, body: JSON.stringify(payload), signal: controller.signal,
-    });
+    const res = await postChatWithWake(headers, payload);
 
     if (!res.ok || !(res.headers.get("content-type") || "").includes("event-stream")) {
       let msg = `HTTP ${res.status}`;
       try { const j = await res.json(); msg = j.error || msg; } catch (_) {}
-      if (res.status === 401) { localStorage.removeItem("qwenchat.code"); msg += " — set access code in ⚙ settings"; }
       throw new Error(msg);
     }
 
