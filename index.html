@@ -112,8 +112,8 @@
   <textarea id="sSystem"></textarea>
   <label>Temperature: <span id="tVal">0.7</span></label>
   <input type="range" id="sTemp" min="0" max="2" step="0.1" value="0.7" style="width:100%">
-  <label>Max tokens</label>
-  <input type="number" id="sMax" value="4000" min="256" max="8000">
+  <label>Max tokens <span style="color:var(--dim)">(up to 32000; higher = longer possible replies)</span></label>
+  <input type="number" id="sMax" value="16000" min="256" max="32000">
   <label>Context depth <span style="color:var(--dim)">(last N messages sent to the model)</span></label>
   <input type="number" id="sDepth" value="30" min="2" max="200">
   <label>Access code <span style="color:var(--dim)">(only if CHAT_ACCESS_CODE is set on Netlify)</span></label>
@@ -246,7 +246,7 @@ async function send() {
     const payload = {
       messages: history.slice(-parseInt(localStorage.getItem("qwenchat.depth") || "30", 10)),
       temperature: parseFloat(localStorage.getItem("qwenchat.temp") || "0.7"),
-      max_tokens: parseInt(localStorage.getItem("qwenchat.max") || "4000", 10),
+      max_tokens: parseInt(localStorage.getItem("qwenchat.max") || "16000", 10),
     };
     const sys = localStorage.getItem("qwenchat.system");
     if (sys) payload.messages = [{ role: "system", content: sys }, ...payload.messages];
@@ -277,6 +277,7 @@ async function send() {
         try { j = JSON.parse(dataStr); } catch (_) { continue; }
         if (j.control === "done") break stream;
         if (j.error) { sawError = true; streamAppend(div, (div._raw ? "\n\n" : "") + "⚠ " + j.error); continue; }
+        if (j.choices?.[0]?.finish_reason) div._finish = j.choices[0].finish_reason;
         const delta = j.choices?.[0]?.delta;
         if (delta?.reasoning_content) continue; // hide thinking
         if (delta?.content) streamAppend(div, delta.content);
@@ -284,6 +285,10 @@ async function send() {
     }
     streamEnd(div);
     const finalText = (div._raw || "").trim();
+    if (div._finish === "length") {
+      div.querySelector(".body").innerHTML = renderBody(finalText) +
+        `\n\n<i style="color:var(--warn)">— hit the max-tokens cap (settings ⚙); reply may be incomplete —</i>`;
+    }
     if (sawError || !finalText) {
       if (!finalText) { div.querySelector(".body").innerHTML = "<i>(empty response — worker may still be booting; try again)</i>"; }
       checkWarm();

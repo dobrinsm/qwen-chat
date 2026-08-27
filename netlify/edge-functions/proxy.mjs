@@ -15,9 +15,9 @@
 
 const DEFAULT_BASE = "https://api.runpod.ai/v2/c35fhlr8aefckk/openai/v1";
 const MODEL = "sakamakismile/Huihui-Qwen3.8-27B-abliterated-NVFP4";
-const UPSTREAM_TIMEOUT_MS = 540000; // 9 min hard cap for a warm streaming call
+const UPSTREAM_TIMEOUT_MS = 1500000; // 25 min hard cap for a long warm generation
 const WARM_CHECK_TIMEOUT_MS = 20000; // warm /models can take ~7s; cold hangs 300s — 20s splits them
-const MAX_TOKENS_CAP = 8000; // stay well below 64K ctx; near-ctx max_tokens -> empty stream
+const MAX_TOKENS_CAP = 32000; // proven safe ceiling on 64K ctx; >= ~60K -> empty stream
 
 function envGet(name) {
   try {
