@@ -1,0 +1,19 @@
+[build]
+  publish = "."
+  command = ""
+
+# Edge functions: no 60s cap issue (headers return immediately, stream stays open
+# through RunPod cold boots ~2-7 min). Normal functions would die at 60s.
+[[edge_functions]]
+  function = "proxy"
+  path = "/api/chat"
+
+[[edge_functions]]
+  function = "warm"
+  path = "/api/warm"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
