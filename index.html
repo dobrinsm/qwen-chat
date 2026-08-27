@@ -51,6 +51,12 @@
     padding: 10px 12px; overflow-x: auto; margin: 8px 0; white-space: pre;
   }
   .msg .body pre code { background: none; border: none; padding: 0; }
+  .cont {
+    display: block; margin: 8px 0 0; background: none; color: var(--accent);
+    border: 1px solid var(--accent); border-radius: 7px; padding: 4px 12px;
+    font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .cont:hover { background: var(--accent); color: #fff; }
   .cursor { display: inline-block; width: 8px; height: 15px; background: var(--accent);
     vertical-align: text-bottom; animation: blink 1s steps(1) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
@@ -134,6 +140,8 @@ const MODEL_LABEL = "assistant";
 
 let history = [];
 try { history = JSON.parse(localStorage.getItem("qwenchat.history") || "[]"); } catch (_) { history = []; }
+// migrate the old 4000 default (cause of mid-reply cutoffs) up to the new default
+if (localStorage.getItem("qwenchat.max") === "4000") localStorage.setItem("qwenchat.max", "16000");
 let controller = null, busy = false;
 
 function save() { localStorage.setItem("qwenchat.history", JSON.stringify(history.slice(-60))); }
@@ -176,6 +184,116 @@ function streamAppend(div, chunk) {
 function streamEnd(div) {
   const body = div.querySelector(".body");
   body.innerHTML = renderBody(div._raw || "");
+}
+
+let lastAssistant = null;
+
+function markLength(div, finalText) {
+  div.querySelector(".body").innerHTML = renderBody(finalText) +
+    `\n\n<i style="color:var(--warn)">— hit the max-tokens cap (settings ⚙); reply may be incomplete —</i>`;
+}
+function addContinueBtn(div) {
+  const b = document.createElement("button");
+  b.className = "cont";
+  b.textContent = "▶ continue";
+  b.onclick = continueReply;
+  div.appendChild(b);
+}
+
+// shared SSE reader: streams chunks into div, returns {finish, sawError}
+async function readSSE(res, div) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  const out = { finish: null, sawError: false };
+  stream: for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const dataStr = t.slice(5).trim();
+      if (dataStr === "[DONE]") break stream;
+      let j;
+      try { j = JSON.parse(dataStr); } catch (_) { continue; }
+      if (j.control === "done") break stream;
+      if (j.error) { out.sawError = true; streamAppend(div, (div._raw ? "\n\n" : "") + "⚠ " + j.error); continue; }
+      if (j.choices?.[0]?.finish_reason) out.finish = j.choices[0].finish_reason;
+      const delta = j.choices?.[0]?.delta;
+      if (delta?.reasoning_content) continue; // hide thinking
+      if (delta?.content) streamAppend(div, delta.content);
+    }
+  }
+  return out;
+}
+
+// Resume a reply that hit the max-tokens cap: feed the model its own truncated
+// output and have it continue seamlessly into the same bubble.
+async function continueReply() {
+  const src = lastAssistant;
+  if (!src || busy) return;
+  const before = (src.div._raw || "").trim();
+  if (!before) return;
+  busy = true; sendBtn.disabled = true; sendBtn.style.display = "none"; stopBtn.style.display = "";
+  src.div.querySelectorAll(".cont").forEach((b) => b.remove());
+  controller = new AbortController();
+  try {
+    const headers = { "Content-Type": "application/json" };
+    const code = localStorage.getItem("qwenchat.code");
+    if (code) headers["x-access-code"] = code;
+    const messages = [];
+    const sys = localStorage.getItem("qwenchat.system");
+    if (sys) messages.push({ role: "system", content: sys });
+    messages.push({ role: "assistant", content: before.slice(-4000) });
+    messages.push({ role: "user", content: "Your reply above was cut off mid-way. Continue it seamlessly from the exact point it ends — no repetition, no preamble, no commentary. If it was already complete, reply with exactly: DONE" });
+    const payload = {
+      messages,
+      temperature: parseFloat(localStorage.getItem("qwenchat.temp") || "0.7"),
+      max_tokens: parseInt(localStorage.getItem("qwenchat.max") || "16000", 10),
+    };
+    const res = await postChatWithWake(headers, payload);
+    if (!res.ok || !(res.headers.get("content-type") || "").includes("event-stream")) {
+      let msg = `HTTP ${res.status}`;
+      try { const jj = await res.json(); msg = jj.error || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const sse = await readSSE(res, src.div);
+    let add = (src.div._raw || "").slice(before.length).trim();
+    // trim any overlap at the seam
+    for (let L = Math.min(160, add.length, before.length); L >= 20; L--) {
+      if (add.slice(0, L) === before.slice(before.length - L)) { add = add.slice(L); break; }
+    }
+    if (/^DONE\.?\s*$/i.test(add)) {
+      src.div._raw = before;
+    } else if (add) {
+      src.div._raw = before + "\n" + add;
+    }
+    streamEnd(src.div);
+    lastAssistant = { div: src.div, finish: sse.finish || "stop" };
+    if (/^DONE\.?\s*$/i.test(add)) {
+      // already complete — no notice, no button
+    } else if (sse.finish === "length") {
+      markLength(src.div, src.div._raw);
+      addContinueBtn(src.div);
+    }
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i].role === "assistant") { history[i].content = src.div._raw.trim(); break; }
+    }
+    save();
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      addMsg("error", e.message || String(e));
+      setStatus("err", "error");
+      checkWarm();
+    }
+  } finally {
+    busy = false; controller = null;
+    sendBtn.style.display = ""; sendBtn.disabled = false; stopBtn.style.display = "none";
+    input.focus();
+  }
 }
 
 function setStatus(cls, text) { statusEl.className = cls; statusEl.textContent = text; }
@@ -259,35 +377,13 @@ async function send() {
       throw new Error(msg);
     }
 
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    stream: for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t.startsWith("data:")) continue;
-        const dataStr = t.slice(5).trim();
-        if (dataStr === "[DONE]") break stream;
-        let j;
-        try { j = JSON.parse(dataStr); } catch (_) { continue; }
-        if (j.control === "done") break stream;
-        if (j.error) { sawError = true; streamAppend(div, (div._raw ? "\n\n" : "") + "⚠ " + j.error); continue; }
-        if (j.choices?.[0]?.finish_reason) div._finish = j.choices[0].finish_reason;
-        const delta = j.choices?.[0]?.delta;
-        if (delta?.reasoning_content) continue; // hide thinking
-        if (delta?.content) streamAppend(div, delta.content);
-      }
-    }
+    const sse = await readSSE(res, div);
+    sawError = sse.sawError;
     streamEnd(div);
     const finalText = (div._raw || "").trim();
-    if (div._finish === "length") {
-      div.querySelector(".body").innerHTML = renderBody(finalText) +
-        `\n\n<i style="color:var(--warn)">— hit the max-tokens cap (settings ⚙); reply may be incomplete —</i>`;
+    if (sse.finish === "length") {
+      markLength(div, finalText);
+      addContinueBtn(div);
     }
     if (sawError || !finalText) {
       if (!finalText) { div.querySelector(".body").innerHTML = "<i>(empty response — worker may still be booting; try again)</i>"; }
@@ -295,6 +391,7 @@ async function send() {
     } else {
       history.push({ role: "assistant", content: finalText });
       save();
+      lastAssistant = { div, finish: sse.finish };
     }
   } catch (e) {
     streamEnd(div);
