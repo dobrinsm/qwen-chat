@@ -33,8 +33,12 @@ env vars — or update `DEFAULT_BASE` in both edge functions and push.
 
 ## Notes
 
+- **Cold starts**: RunPod's OpenAI streaming route hangs for a fixed ~300s and
+  returns an empty stream if the request lands while the worker is booting.
+  The proxy therefore pre-flights `/models` (20s budget) and returns
+  `503 {cold:true}`; the UI shows a wake banner and auto-retries every 15s
+  (~5 min of patience) before streaming. Warm streaming is unaffected.
 - `max_tokens` is capped at 8000 (well below the 64K context) — near-context
   max_tokens makes vLLM return an empty stream.
 - RunPod serverless scales to zero at rest: idle = $0. First request after idle
-  pays a 2–7 min boot; the UI shows a cold-start banner and keeps the request
-  open until the answer streams.
+  pays a 2–7 min boot; the UI handles the wait automatically.
